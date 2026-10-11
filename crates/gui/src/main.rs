@@ -42,8 +42,17 @@ struct App {
     jobs: Vec<Job>,
     next_id: u64,
     tools: Option<Vec<tools::Status>>,
-    installing: Option<Tool>,
-    tool_error: Option<String>,
+    /// Tools whose download is running.
+    installing: Vec<Tool>,
+    /// Tools that finished downloading and wait for the re-check that
+    /// confirms them. They keep their "Downloading…" line until then, so the
+    /// row never flashes back to "Install".
+    verifying: Vec<Tool>,
+    /// Tools confirmed installed a moment ago, shown briefly as done.
+    just_installed: Vec<Tool>,
+    /// Bumped per tool check; only the newest check settles `verifying`.
+    check_gen: u64,
+    tool_errors: Vec<String>,
     updates_dismissed: bool,
 }
 
@@ -85,10 +94,12 @@ enum Message {
     Remove(u64),
     ShowInFolder(PathBuf),
     ClearFinished,
-    ToolsChecked(Vec<tools::Status>),
+    ToolsChecked(u64, Vec<tools::Status>),
     Install(Tool),
+    InstallAll,
+    ClearInstalled,
     Recheck,
-    Installed(Result<(), String>),
+    Installed(Tool, Result<(), String>),
     DismissUpdates,
 }
 
@@ -102,11 +113,17 @@ impl App {
             jobs: Vec::new(),
             next_id: 0,
             tools: None,
-            installing: None,
-            tool_error: None,
+            installing: Vec::new(),
+            verifying: Vec::new(),
+            just_installed: Vec::new(),
+            check_gen: 0,
+            tool_errors: Vec::new(),
             updates_dismissed: false,
         };
-        (app, Task::perform(tools::check(), Message::ToolsChecked))
+        (
+            app,
+            Task::perform(tools::check(), |s| Message::ToolsChecked(0, s)),
+        )
     }
 
     fn theme(&self) -> Theme {
@@ -213,38 +230,96 @@ impl App {
             }
             Message::ShowInFolder(path) => show_in_folder(&path),
             Message::ClearFinished => self.jobs.retain(|j| !j.state.is_finished()),
-            Message::ToolsChecked(status) => {
+            Message::ToolsChecked(generation, status) => {
                 self.tools = Some(status);
-                return self.start_queued();
-            }
-            Message::Install(tool) => {
-                if self.installing.is_none() {
-                    self.installing = Some(tool);
-                    self.tool_error = None;
-                    return Task::perform(tools::install(tool), Message::Installed);
+                let mut tasks = Vec::new();
+                if generation == self.check_gen && !self.verifying.is_empty() {
+                    for tool in std::mem::take(&mut self.verifying) {
+                        if self.installed(tool).is_some() {
+                            self.just_installed.push(tool);
+                        } else {
+                            self.tool_errors.push(format!(
+                                "{} was downloaded but did not start. Antivirus may be blocking it.",
+                                tool.name()
+                            ));
+                        }
+                    }
+                    tasks.push(Task::perform(
+                        tokio::time::sleep(std::time::Duration::from_secs(6)),
+                        |_| Message::ClearInstalled,
+                    ));
                 }
+                tasks.push(self.start_queued());
+                return Task::batch(tasks);
             }
-            Message::Installed(result) => {
-                self.installing = None;
-                if let Err(e) = result {
-                    self.tool_error = Some(e);
+            Message::Install(tool) => return self.install(tool),
+            Message::InstallAll => {
+                let tools: Vec<Tool> = self
+                    .tools
+                    .iter()
+                    .flatten()
+                    .filter(|s| self.needs_action(s))
+                    .map(|s| s.tool)
+                    .collect();
+                return Task::batch(tools.into_iter().map(|t| self.install(t)));
+            }
+            Message::Installed(tool, result) => {
+                self.installing.retain(|t| *t != tool);
+                match result {
+                    Ok(()) => self.verifying.push(tool),
+                    Err(e) => self.tool_errors.push(format!("{}: {e}", tool.name())),
                 }
-                return Task::perform(tools::check(), Message::ToolsChecked);
+                return self.recheck();
+            }
+            Message::ClearInstalled => {
+                if self.installing.is_empty() && self.verifying.is_empty() {
+                    self.just_installed.clear();
+                }
             }
             Message::Recheck => {
                 self.tools = None;
-                self.tool_error = None;
-                return Task::perform(tools::check(), Message::ToolsChecked);
+                self.tool_errors.clear();
+                return self.recheck();
             }
             Message::DismissUpdates => self.updates_dismissed = true,
         }
         Task::none()
     }
 
+    fn install(&mut self, tool: Tool) -> Task<Message> {
+        if self.installing.contains(&tool) || self.verifying.contains(&tool) {
+            return Task::none();
+        }
+        self.installing.push(tool);
+        self.just_installed.retain(|t| *t != tool);
+        self.tool_errors.clear();
+        Task::perform(tools::install(tool), move |r| Message::Installed(tool, r))
+    }
+
+    fn recheck(&mut self) -> Task<Message> {
+        self.check_gen += 1;
+        let generation = self.check_gen;
+        Task::perform(tools::check(), move |s| {
+            Message::ToolsChecked(generation, s)
+        })
+    }
+
+    /// Missing (and not broken) or outdated and not dismissed.
+    fn needs_action(&self, status: &tools::Status) -> bool {
+        match &status.installed {
+            None => status.problem.is_none(),
+            Some(_) => status.update_available() && !self.updates_dismissed,
+        }
+    }
+
+    fn busy(&self, tool: Tool) -> bool {
+        self.installing.contains(&tool) || self.verifying.contains(&tool)
+    }
+
     /// Fills free download slots from the queue. Waits while a tool is
     /// being replaced, since Windows will not overwrite a running exe.
     fn start_queued(&mut self) -> Task<Message> {
-        if self.installing.is_some() {
+        if !self.installing.is_empty() || !self.verifying.is_empty() {
             return Task::none();
         }
         let (Some(yt), Some(ff)) = (self.installed(Tool::YtDlp), self.installed(Tool::Ffmpeg))
@@ -373,9 +448,15 @@ impl App {
         let mut lines = column![].spacing(8);
         let mut any = false;
         let mut any_update = false;
+        let mut actionable = 0;
         for status in statuses {
             let name = status.tool.name();
             let line: Option<(String, &str)> = match &status.installed {
+                Some(i)
+                    if self.just_installed.contains(&status.tool) && !self.busy(status.tool) =>
+                {
+                    Some((format!("{name} {} is installed.", i.version), ""))
+                }
                 None if status.problem.is_some() => Some((
                     format!(
                         "{} Antivirus may be blocking it.",
@@ -402,23 +483,28 @@ impl App {
                 continue;
             };
             any = true;
-            let control: Element<_> = if self.installing == Some(status.tool) {
+            let control: Element<_> = if self.installing.contains(&status.tool) {
                 text("Downloading…")
                     .size(13)
                     .style(style::muted_text)
                     .into()
+            } else if self.verifying.contains(&status.tool) {
+                text("Checking…").size(13).style(style::muted_text).into()
+            } else if action.is_empty() {
+                text("Done").size(13).style(style::success_text).into()
             } else {
-                let mut b = button(text(action).size(13))
+                if self.needs_action(status) {
+                    actionable += 1;
+                }
+                button(text(action).size(13))
                     .padding([3, 10])
-                    .style(style::action);
-                if self.installing.is_none() {
-                    b = b.on_press(if status.problem.is_some() {
+                    .style(style::action)
+                    .on_press(if status.problem.is_some() {
                         Message::Recheck
                     } else {
                         Message::Install(status.tool)
-                    });
-                }
-                b.into()
+                    })
+                    .into()
             };
             lines = lines.push(
                 row![text(label).size(13).width(Length::Fill), control]
@@ -426,9 +512,21 @@ impl App {
                     .align_y(Alignment::Center),
             );
         }
-        if let Some(e) = &self.tool_error {
+        for e in &self.tool_errors {
             any = true;
             lines = lines.push(text(e).size(12).style(style::danger_text));
+        }
+        if actionable >= 2 {
+            lines = lines.push(
+                row![
+                    horizontal_space(),
+                    button(text("Install all").size(13))
+                        .padding([3, 10])
+                        .style(style::action)
+                        .on_press(Message::InstallAll),
+                ]
+                .align_y(Alignment::Center),
+            );
         }
         if !any {
             return None;

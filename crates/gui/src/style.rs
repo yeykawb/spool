@@ -48,6 +48,12 @@ pub fn muted_text(theme: &Theme) -> iced::widget::text::Style {
     }
 }
 
+pub fn success_text(theme: &Theme) -> iced::widget::text::Style {
+    iced::widget::text::Style {
+        color: Some(theme.palette().success),
+    }
+}
+
 pub fn danger_text(theme: &Theme) -> iced::widget::text::Style {
     iced::widget::text::Style {
         color: Some(theme.palette().danger),

@@ -19,7 +19,7 @@ const DENO_ZIP_URL: &str =
     "https://github.com/denoland/deno/releases/latest/download/deno-x86_64-pc-windows-msvc.zip";
 const USER_AGENT: &str = concat!("spool/", env!("CARGO_PKG_VERSION"));
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Tool {
     YtDlp,
     Ffmpeg,
