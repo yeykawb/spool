@@ -2,6 +2,8 @@
 
 A minimal Windows app for saving audio as MP3. Paste a link to a video or a playlist and spool downloads each track with [yt-dlp](https://github.com/yt-dlp/yt-dlp) and converts it with [ffmpeg](https://ffmpeg.org). Written in Rust with [iced](https://iced.rs).
 
+![spool in night mode](docs/screenshot.png)
+
 - Dark by default. The moon/sun icon switches to day mode, and the choice is remembered.
 - Playlists are split into one row per track. Three tracks download at a time.
 - Click the quality to cycle 320 / 256 / 192 / 128 kbps. Click the folder to change where files go (default: `Music\spool`).
