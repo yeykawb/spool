@@ -1,0 +1,13 @@
+[package]
+name = "spool-core"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+directories = "6"
+futures = "0.3"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+serde = { version = "1", features = ["derive"] }
+tokio = { version = "1", features = ["process", "io-util", "fs", "rt", "macros"] }
+which = "7"
+zip = { version = "2", default-features = false, features = ["deflate"] }
