@@ -18,6 +18,17 @@ Install and Update both download into spool's own folder, and that copy is used 
 
 [Deno](https://deno.com) is the JavaScript runtime recent yt-dlp versions need for full YouTube support. It is optional: downloads still start without it, but some YouTube links may fail or offer fewer formats. YouTube changes often, so keep yt-dlp current.
 
+## Download
+
+Grab `spool.exe` from the [latest release](https://github.com/yeykawb/spool/releases/latest). No Rust or installer needed. The exe is not code-signed, so the first time Windows shows "Windows protected your PC": click **More info**, then **Run anyway**.
+
+To publish a new release, push a version tag:
+
+```
+git tag v0.1.0
+git push origin v0.1.0
+```
+
 ## Build
 
 Needs Rust (stable) on Windows:
@@ -26,7 +37,7 @@ Needs Rust (stable) on Windows:
 cargo run --release
 ```
 
-The exe ends up in `target\release\spool.exe`. CI also builds it on every push; grab `spool.exe` from the workflow run's artifacts.
+The exe ends up in `target\release\spool.exe`. CI also builds it on every push and keeps `spool.exe` as a workflow artifact.
 
 ## Layout
 
