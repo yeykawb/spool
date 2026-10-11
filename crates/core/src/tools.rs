@@ -1,4 +1,4 @@
-//! Locating yt-dlp and ffmpeg, reading their versions, and checking for
+//! Locating yt-dlp, ffmpeg and Deno, reading their versions, and checking for
 //! newer releases.
 //!
 //! Tools are never bundled. spool uses its own copies in the app-data
@@ -14,21 +14,28 @@ const YT_DLP_LATEST_API: &str = "https://api.github.com/repos/yt-dlp/yt-dlp/rele
 const YT_DLP_EXE_URL: &str = "https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp.exe";
 const FFMPEG_LATEST_URL: &str = "https://www.gyan.dev/ffmpeg/builds/release-version";
 const FFMPEG_ZIP_URL: &str = "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip";
+const DENO_LATEST_API: &str = "https://api.github.com/repos/denoland/deno/releases/latest";
+const DENO_ZIP_URL: &str =
+    "https://github.com/denoland/deno/releases/latest/download/deno-x86_64-pc-windows-msvc.zip";
 const USER_AGENT: &str = concat!("spool/", env!("CARGO_PKG_VERSION"));
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Tool {
     YtDlp,
     Ffmpeg,
+    /// JavaScript runtime yt-dlp needs for full YouTube support. Optional:
+    /// downloads still run without it.
+    Deno,
 }
 
 impl Tool {
-    pub const ALL: [Tool; 2] = [Tool::YtDlp, Tool::Ffmpeg];
+    pub const ALL: [Tool; 3] = [Tool::YtDlp, Tool::Ffmpeg, Tool::Deno];
 
     pub fn name(self) -> &'static str {
         match self {
             Tool::YtDlp => "yt-dlp",
             Tool::Ffmpeg => "ffmpeg",
+            Tool::Deno => "deno",
         }
     }
 
@@ -69,10 +76,9 @@ pub fn managed_dir() -> PathBuf {
         .unwrap_or_else(|| std::env::temp_dir().join("spool").join("bin"))
 }
 
-/// Finds both tools and checks for newer releases.
+/// Finds every tool and checks for newer releases.
 pub async fn check() -> Vec<Status> {
-    let (yt, ff) = futures::join!(check_one(Tool::YtDlp), check_one(Tool::Ffmpeg));
-    vec![yt, ff]
+    futures::future::join_all(Tool::ALL.map(check_one)).await
 }
 
 async fn check_one(tool: Tool) -> Status {
@@ -101,7 +107,7 @@ async fn find(tool: Tool) -> Option<Installed> {
 
 async fn installed_version(tool: Tool, path: &Path) -> Result<String> {
     let flag = match tool {
-        Tool::YtDlp => "--version",
+        Tool::YtDlp | Tool::Deno => "--version",
         Tool::Ffmpeg => "-version",
     };
     let out = command(path)
@@ -125,28 +131,23 @@ async fn installed_version(tool: Tool, path: &Path) -> Result<String> {
                     .to_string()
             })
             .ok_or_else(|| format!("unexpected ffmpeg output: {first}")),
+        // "deno 2.5.4 (stable, release, x86_64-pc-windows-msvc)"
+        Tool::Deno => first
+            .split_whitespace()
+            .nth(1)
+            .map(str::to_string)
+            .ok_or_else(|| format!("unexpected deno output: {first}")),
     }
 }
 
 async fn latest_version(tool: Tool) -> Result<String> {
     let client = http()?;
     match tool {
-        Tool::YtDlp => {
-            #[derive(serde::Deserialize)]
-            struct Release {
-                tag_name: String,
-            }
-            let release: Release = client
-                .get(YT_DLP_LATEST_API)
-                .send()
-                .await
-                .and_then(|r| r.error_for_status())
-                .map_err(|e| e.to_string())?
-                .json()
-                .await
-                .map_err(|e| e.to_string())?;
-            Ok(release.tag_name)
-        }
+        Tool::YtDlp => github_tag(&client, YT_DLP_LATEST_API).await,
+        Tool::Deno => Ok(github_tag(&client, DENO_LATEST_API)
+            .await?
+            .trim_start_matches('v')
+            .to_string()),
         Tool::Ffmpeg => Ok(client
             .get(FFMPEG_LATEST_URL)
             .send()
@@ -159,6 +160,23 @@ async fn latest_version(tool: Tool) -> Result<String> {
             .trim()
             .to_string()),
     }
+}
+
+async fn github_tag(client: &reqwest::Client, api: &str) -> Result<String> {
+    #[derive(serde::Deserialize)]
+    struct Release {
+        tag_name: String,
+    }
+    let release: Release = client
+        .get(api)
+        .send()
+        .await
+        .and_then(|r| r.error_for_status())
+        .map_err(|e| e.to_string())?
+        .json()
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(release.tag_name)
 }
 
 /// True when `latest` is a strictly higher dotted version than `current`.
@@ -193,17 +211,20 @@ pub async fn install(tool: Tool) -> Result<()> {
             download_to(YT_DLP_EXE_URL, &tmp).await?;
             replace(&tmp, &dir.join(tool.file_name())).await
         }
-        Tool::Ffmpeg => {
-            let zip = dir.join("ffmpeg.zip.part");
-            download_to(FFMPEG_ZIP_URL, &zip).await?;
-            let out = dir.clone();
-            let result = tokio::task::spawn_blocking(move || extract_ffmpeg(&zip, &out))
-                .await
-                .map_err(|e| e.to_string())?;
-            let _ = tokio::fs::remove_file(dir.join("ffmpeg.zip.part")).await;
-            result
-        }
+        Tool::Ffmpeg => install_zip(FFMPEG_ZIP_URL, &dir, &["ffmpeg.exe", "ffprobe.exe"]).await,
+        Tool::Deno => install_zip(DENO_ZIP_URL, &dir, &["deno.exe"]).await,
     }
+}
+
+async fn install_zip(url: &str, dir: &Path, exes: &'static [&'static str]) -> Result<()> {
+    let zip = dir.join(format!("{}.zip.part", exes[0]));
+    download_to(url, &zip).await?;
+    let (zip_path, out) = (zip.clone(), dir.to_path_buf());
+    let result = tokio::task::spawn_blocking(move || extract(&zip_path, &out, exes))
+        .await
+        .map_err(|e| e.to_string())?;
+    let _ = tokio::fs::remove_file(zip).await;
+    result
 }
 
 fn http() -> Result<reqwest::Client> {
@@ -244,17 +265,18 @@ async fn replace(tmp: &Path, dest: &Path) -> Result<()> {
     })
 }
 
-/// Pulls ffmpeg.exe and ffprobe.exe out of the gyan.dev zip, whose layout
-/// is `ffmpeg-<version>-essentials_build/bin/<exe>`.
-fn extract_ffmpeg(zip_path: &Path, out_dir: &Path) -> Result<()> {
+/// Pulls the named executables out of a release zip, wherever they sit in
+/// it (gyan.dev nests them under `ffmpeg-<version>-essentials_build/bin/`,
+/// Deno puts `deno.exe` at the root).
+fn extract(zip_path: &Path, out_dir: &Path, exes: &[&str]) -> Result<()> {
     let file = std::fs::File::open(zip_path).map_err(|e| e.to_string())?;
     let mut archive = zip::ZipArchive::new(file).map_err(|e| e.to_string())?;
-    for exe in ["ffmpeg.exe", "ffprobe.exe"] {
+    for &exe in exes {
         let name = archive
             .file_names()
-            .find(|n| n.ends_with(&format!("/bin/{exe}")))
+            .find(|n| n.rsplit('/').next() == Some(exe))
             .map(str::to_string)
-            .ok_or_else(|| format!("{exe} not found in the ffmpeg download"))?;
+            .ok_or_else(|| format!("{exe} not found in the download"))?;
         let mut entry = archive.by_name(&name).map_err(|e| e.to_string())?;
         let tmp = out_dir.join(format!("{exe}.part"));
         let mut out = std::fs::File::create(&tmp).map_err(|e| e.to_string())?;

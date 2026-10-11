@@ -20,6 +20,9 @@ pub struct Options {
     pub yt_dlp: PathBuf,
     /// Folder holding ffmpeg. None lets yt-dlp search PATH itself.
     pub ffmpeg_dir: Option<PathBuf>,
+    /// Deno for YouTube's JavaScript challenges. None leaves yt-dlp to its
+    /// defaults, which still work for most other sites.
+    pub deno: Option<PathBuf>,
     pub out_dir: PathBuf,
     pub bitrate_kbps: u32,
 }
@@ -117,6 +120,10 @@ async fn run(opts: &Options, url: &str, tx: Sender<Progress>) -> Result<PathBuf>
         .args(["-o", "%(title)s.%(ext)s"]);
     if let Some(dir) = &opts.ffmpeg_dir {
         cmd.arg("--ffmpeg-location").arg(dir);
+    }
+    if let Some(deno) = &opts.deno {
+        cmd.arg("--js-runtimes")
+            .arg(format!("deno:{}", deno.display()));
     }
     cmd.arg("--").arg(url);
 

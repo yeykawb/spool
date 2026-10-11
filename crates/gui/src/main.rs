@@ -240,6 +240,11 @@ impl App {
         let opts = job::Options {
             yt_dlp: yt.path.clone(),
             ffmpeg_dir: ff.path.parent().map(PathBuf::from),
+            // --js-runtimes only exists from yt-dlp 2025.11.12 on.
+            deno: self
+                .installed(Tool::Deno)
+                .filter(|_| !tools::is_newer("2025.11.12", &yt.version))
+                .map(|d| d.path.clone()),
             out_dir: self.settings.out_dir.clone(),
             bitrate_kbps: self.settings.bitrate_kbps,
         };
@@ -356,6 +361,10 @@ impl App {
         for status in statuses {
             let name = status.tool.name();
             let line: Option<(String, &str)> = match &status.installed {
+                None if status.tool == Tool::Deno => Some((
+                    "Deno is not installed. YouTube needs it for full support.".to_string(),
+                    "Install",
+                )),
                 None => Some((format!("{name} is not installed."), "Install")),
                 Some(i) if status.update_available() && !self.updates_dismissed => {
                     any_update = true;
@@ -447,7 +456,7 @@ impl App {
                 .map(|i| format!("{} {}", t.name(), i.version))
                 .unwrap_or_else(|| format!("{} missing", t.name()))
         };
-        let versions = format!("{} · {}", version(Tool::YtDlp), version(Tool::Ffmpeg));
+        let versions = Tool::ALL.map(version).join(" · ");
 
         let mut left = row![text(summary).size(12).style(style::muted_text)].spacing(14);
         if done + failed > 0 {
