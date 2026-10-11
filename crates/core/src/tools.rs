@@ -19,7 +19,7 @@ const DENO_ZIP_URL: &str =
     "https://github.com/denoland/deno/releases/latest/download/deno-x86_64-pc-windows-msvc.zip";
 const USER_AGENT: &str = concat!("spool/", env!("CARGO_PKG_VERSION"));
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Tool {
     YtDlp,
     Ffmpeg,
@@ -56,6 +56,10 @@ pub struct Installed {
 pub struct Status {
     pub tool: Tool,
     pub installed: Option<Installed>,
+    /// Set when the tool is present but would not run, for example because
+    /// antivirus blocked it. Installing again would not help, so the UI
+    /// offers a re-check instead.
+    pub problem: Option<String>,
     /// Newest released version, or None when the check failed (offline).
     pub latest: Option<String>,
 }
@@ -82,39 +86,74 @@ pub async fn check() -> Vec<Status> {
 }
 
 async fn check_one(tool: Tool) -> Status {
-    let (installed, latest) = futures::join!(find(tool), latest_version(tool));
+    let (found, latest) = futures::join!(find(tool), latest_version(tool));
+    let (installed, problem) = match found {
+        Ok(installed) => (installed, None),
+        Err(problem) => (None, Some(problem)),
+    };
     Status {
         tool,
         installed,
+        problem,
         latest: latest.ok(),
     }
 }
 
-async fn find(tool: Tool) -> Option<Installed> {
+/// Ok(None) means the tool is nowhere to be found. Err means a copy exists
+/// but none of them would run.
+async fn find(tool: Tool) -> Result<Option<Installed>> {
     let managed = managed_dir().join(tool.file_name());
-    let (path, is_managed) = if managed.is_file() {
-        (managed, true)
-    } else {
-        (which::which(tool.name()).ok()?, false)
-    };
-    let version = installed_version(tool, &path).await.ok()?;
-    Some(Installed {
-        path,
-        version,
-        managed: is_managed,
-    })
+    let candidates = [
+        managed.is_file().then_some((managed, true)),
+        which::which(tool.name()).ok().map(|p| (p, false)),
+    ];
+
+    let mut failure = None;
+    for (path, managed) in candidates.into_iter().flatten() {
+        match installed_version(tool, &path).await {
+            Ok(version) => {
+                return Ok(Some(Installed {
+                    path,
+                    version,
+                    managed,
+                }))
+            }
+            Err(e) => failure = Some(format!("{} would not start ({e}).", path.display())),
+        }
+    }
+    failure.map_or(Ok(None), Err)
 }
 
+/// Runs the tool for its version. Retries once, since the first launch of a
+/// big exe can fail or stall while antivirus scans it.
 async fn installed_version(tool: Tool, path: &Path) -> Result<String> {
+    match read_version(tool, path).await {
+        Ok(v) => Ok(v),
+        Err(_) => {
+            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+            read_version(tool, path).await
+        }
+    }
+}
+
+async fn read_version(tool: Tool, path: &Path) -> Result<String> {
     let flag = match tool {
         Tool::YtDlp | Tool::Deno => "--version",
         Tool::Ffmpeg => "-version",
     };
-    let out = command(path)
-        .arg(flag)
-        .output()
-        .await
-        .map_err(|e| e.to_string())?;
+    let out = tokio::time::timeout(
+        std::time::Duration::from_secs(20),
+        command(path).arg(flag).output(),
+    )
+    .await
+    .map_err(|_| "timed out".to_string())?
+    .map_err(|e| e.to_string())?;
+    if !out.status.success() {
+        return Err(match out.status.code() {
+            Some(code) => format!("exit code {code}"),
+            None => "it was stopped".to_string(),
+        });
+    }
     let stdout = String::from_utf8_lossy(&out.stdout);
     let first = stdout.lines().next().unwrap_or_default().trim();
     match tool {
