@@ -20,11 +20,17 @@ const PARALLEL: usize = 3;
 
 const MOON: &[u8] = include_bytes!("../assets/moon.svg");
 const SUN: &[u8] = include_bytes!("../assets/sun.svg");
+const FOLDER: &[u8] = include_bytes!("../assets/folder.svg");
+const ICON: &[u8] = include_bytes!("../assets/icon.png");
 
 fn main() -> iced::Result {
     iced::application("spool", App::update, App::view)
         .theme(App::theme)
-        .window_size(Size::new(640.0, 520.0))
+        .window(iced::window::Settings {
+            size: Size::new(640.0, 520.0),
+            icon: iced::window::icon::from_file_data(ICON, None).ok(),
+            ..Default::default()
+        })
         .run_with(App::new)
 }
 
@@ -53,7 +59,7 @@ enum JobState {
     Queued,
     Downloading(f32),
     Converting,
-    Done,
+    Done(PathBuf),
     Failed(String),
 }
 
@@ -62,7 +68,7 @@ impl JobState {
         matches!(self, JobState::Downloading(_) | JobState::Converting)
     }
     fn is_finished(&self) -> bool {
-        matches!(self, JobState::Done | JobState::Failed(_))
+        matches!(self, JobState::Done(_) | JobState::Failed(_))
     }
 }
 
@@ -77,6 +83,7 @@ enum Message {
     ToggleTheme,
     Progress(u64, Progress),
     Remove(u64),
+    ShowInFolder(PathBuf),
     ClearFinished,
     ToolsChecked(Vec<tools::Status>),
     Install(Tool),
@@ -185,7 +192,7 @@ impl App {
                     job.state = match progress {
                         Progress::Downloading(p) => JobState::Downloading(p),
                         Progress::Converting => JobState::Converting,
-                        Progress::Done(_) => JobState::Done,
+                        Progress::Done(path) => JobState::Done(path),
                         Progress::Failed(e) => JobState::Failed(e),
                     };
                     if job.state.is_finished() {
@@ -203,6 +210,7 @@ impl App {
                     return self.start_queued();
                 }
             }
+            Message::ShowInFolder(path) => show_in_folder(&path),
             Message::ClearFinished => self.jobs.retain(|j| !j.state.is_finished()),
             Message::ToolsChecked(status) => {
                 self.tools = Some(status);
@@ -283,7 +291,8 @@ impl App {
         let hint = if self.resolving {
             "Looking up…"
         } else if self.ready() {
-            "Enter ↵"
+            // The default font has no ↵ glyph on Windows.
+            "Press Enter"
         } else {
             ""
         };
@@ -433,7 +442,7 @@ impl App {
         let done = self
             .jobs
             .iter()
-            .filter(|j| j.state == JobState::Done)
+            .filter(|j| matches!(j.state, JobState::Done(_)))
             .count();
         let running = self.jobs.iter().filter(|j| j.state.is_active()).count();
         let failed = self
@@ -495,7 +504,7 @@ fn job_row(job: &Job) -> Element<'_, Message> {
         JobState::Queued => (0.0, "Queued".to_string()),
         JobState::Downloading(p) => (*p, format!("{p:.0}%")),
         JobState::Converting => (100.0, "Converting".to_string()),
-        JobState::Done => (100.0, "Done".to_string()),
+        JobState::Done(_) => (100.0, "Done".to_string()),
         JobState::Failed(_) => (0.0, "Failed".to_string()),
     };
 
@@ -506,19 +515,25 @@ fn job_row(job: &Job) -> Element<'_, Message> {
         title = title.push(text(e).size(12).style(style::danger_text));
     }
 
-    let remove = if job.state.is_active() {
-        "Cancel"
-    } else {
-        "Remove"
+    // Same width whether or not the folder button shows, so the columns
+    // stay aligned down the list.
+    let reveal: Element<_> = match &job.state {
+        JobState::Done(path) => button(
+            svg(svg::Handle::from_memory(FOLDER))
+                .width(14)
+                .height(14)
+                .style(style::icon),
+        )
+        .padding(3)
+        .style(style::link)
+        .on_press(Message::ShowInFolder(path.clone()))
+        .into(),
+        _ => horizontal_space().width(20).into(),
     };
-    let remove = iced::widget::tooltip(
-        button(text("×").size(14))
-            .padding([0, 4])
-            .style(style::link)
-            .on_press(Message::Remove(job.id)),
-        text(remove).size(12),
-        iced::widget::tooltip::Position::Left,
-    );
+    let remove = button(text("×").size(14))
+        .padding([0, 4])
+        .style(style::link)
+        .on_press(Message::Remove(job.id));
     row![
         container(title).width(Length::Fill).clip(true),
         progress_bar(0.0..=100.0, fill)
@@ -528,10 +543,26 @@ fn job_row(job: &Job) -> Element<'_, Message> {
         container(text(status).size(13).style(style::muted_text))
             .width(72)
             .align_x(Alignment::End),
-        remove,
+        row![reveal, remove].spacing(4).align_y(Alignment::Center),
     ]
     .spacing(16)
     .padding([11, 0])
     .align_y(Alignment::Center)
     .into()
+}
+
+/// Opens Explorer with the file selected.
+fn show_in_folder(path: &std::path::Path) {
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        // Explorer wants `/select,"<path>"` as one unescaped argument.
+        let _ = std::process::Command::new("explorer")
+            .raw_arg(format!("/select,\"{}\"", path.display()))
+            .spawn();
+    }
+    #[cfg(not(windows))]
+    if let Some(dir) = path.parent() {
+        let _ = std::process::Command::new("xdg-open").arg(dir).spawn();
+    }
 }
