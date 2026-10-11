@@ -43,9 +43,16 @@ struct App {
     next_id: u64,
     tools: Option<Vec<tools::Status>>,
     installing: Option<Tool>,
+    /// Installs waiting their turn; one runs at a time.
+    install_queue: Vec<Tool>,
+    /// Finished this round, shown as ready until the notice clears.
+    just_installed: Vec<Tool>,
     tool_error: Option<String>,
     updates_dismissed: bool,
 }
+
+/// How long "Installed" stays up once everything queued is done.
+const INSTALLED_LINGER: std::time::Duration = std::time::Duration::from_secs(4);
 
 struct Job {
     id: u64,
@@ -87,7 +94,9 @@ enum Message {
     ClearFinished,
     ToolsChecked(Vec<tools::Status>),
     Install(Tool),
-    Installed(Result<(), String>),
+    InstallAll,
+    Installed(Tool, Result<(), String>),
+    ClearInstalled,
     DismissUpdates,
 }
 
@@ -102,6 +111,8 @@ impl App {
             next_id: 0,
             tools: None,
             installing: None,
+            install_queue: Vec::new(),
+            just_installed: Vec::new(),
             tool_error: None,
             updates_dismissed: false,
         };
@@ -214,25 +225,69 @@ impl App {
             Message::ClearFinished => self.jobs.retain(|j| !j.state.is_finished()),
             Message::ToolsChecked(status) => {
                 self.tools = Some(status);
-                return self.start_queued();
+                let mut tasks = vec![self.start_queued()];
+                if self.installing.is_none() && !self.just_installed.is_empty() {
+                    tasks.push(Task::perform(tokio::time::sleep(INSTALLED_LINGER), |_| {
+                        Message::ClearInstalled
+                    }));
+                }
+                return Task::batch(tasks);
             }
             Message::Install(tool) => {
-                if self.installing.is_none() {
-                    self.installing = Some(tool);
-                    self.tool_error = None;
-                    return Task::perform(tools::install(tool), Message::Installed);
-                }
+                self.tool_error = None;
+                return self.queue_install(tool);
             }
-            Message::Installed(result) => {
+            Message::InstallAll => {
+                self.tool_error = None;
+                let missing: Vec<Tool> = self
+                    .tools
+                    .iter()
+                    .flatten()
+                    .filter(|s| s.installed.is_none())
+                    .map(|s| s.tool)
+                    .collect();
+                return Task::batch(missing.into_iter().map(|t| self.queue_install(t)));
+            }
+            Message::Installed(tool, result) => {
                 self.installing = None;
-                if let Err(e) = result {
-                    self.tool_error = Some(e);
+                match result {
+                    Ok(()) => self.just_installed.push(tool),
+                    Err(e) => self.tool_error = Some(format!("{}: {e}", tool.name())),
                 }
-                return Task::perform(tools::check(), Message::ToolsChecked);
+                if self.install_queue.is_empty() {
+                    // Only now, so a finished row never flips back to
+                    // "Install" while the others are still going.
+                    return Task::perform(tools::check(), Message::ToolsChecked);
+                }
+                let next = self.install_queue.remove(0);
+                return self.start_install(next);
+            }
+            // A new round may have started meanwhile; leave that one be.
+            Message::ClearInstalled => {
+                if self.installing.is_none() {
+                    self.just_installed.clear();
+                }
             }
             Message::DismissUpdates => self.updates_dismissed = true,
         }
         Task::none()
+    }
+
+    fn queue_install(&mut self, tool: Tool) -> Task<Message> {
+        if self.installing == Some(tool) || self.install_queue.contains(&tool) {
+            return Task::none();
+        }
+        self.just_installed.retain(|&t| t != tool);
+        if self.installing.is_some() {
+            self.install_queue.push(tool);
+            return Task::none();
+        }
+        self.start_install(tool)
+    }
+
+    fn start_install(&mut self, tool: Tool) -> Task<Message> {
+        self.installing = Some(tool);
+        Task::perform(tools::install(tool), move |r| Message::Installed(tool, r))
     }
 
     /// Fills free download slots from the queue. Waits while a tool is
@@ -367,8 +422,22 @@ impl App {
         let mut lines = column![].spacing(8);
         let mut any = false;
         let mut any_update = false;
+        let mut can_install = 0;
         for status in statuses {
             let name = status.tool.name();
+            if self.just_installed.contains(&status.tool) {
+                any = true;
+                lines = lines.push(
+                    row![
+                        text(format!("{name} is ready.")).size(13),
+                        horizontal_space(),
+                        text("Installed").size(13).style(style::success_text),
+                    ]
+                    .spacing(12)
+                    .align_y(Alignment::Center),
+                );
+                continue;
+            }
             let line: Option<(String, &str)> = match &status.installed {
                 None if status.tool == Tool::Deno => Some((
                     "Deno is not installed. YouTube needs it for full support.".to_string(),
@@ -394,19 +463,34 @@ impl App {
                     .size(13)
                     .style(style::muted_text)
                     .into()
+            } else if self.install_queue.contains(&status.tool) {
+                text("Queued").size(13).style(style::muted_text).into()
             } else {
-                let mut b = button(text(action).size(13))
-                    .padding([3, 10])
-                    .style(style::action);
-                if self.installing.is_none() {
-                    b = b.on_press(Message::Install(status.tool));
+                if status.installed.is_none() {
+                    can_install += 1;
                 }
-                b.into()
+                button(text(action).size(13))
+                    .padding([3, 10])
+                    .style(style::action)
+                    .on_press(Message::Install(status.tool))
+                    .into()
             };
             lines = lines.push(
                 row![text(label).size(13), horizontal_space(), control]
                     .spacing(12)
                     .align_y(Alignment::Center),
+            );
+        }
+        if can_install > 1 {
+            lines = lines.push(
+                row![
+                    horizontal_space(),
+                    button(text("Install all").size(13))
+                        .padding([3, 10])
+                        .style(style::action)
+                        .on_press(Message::InstallAll),
+                ]
+                .align_y(Alignment::Center),
             );
         }
         if let Some(e) = &self.tool_error {
