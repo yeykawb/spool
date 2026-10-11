@@ -8,6 +8,6 @@ directories = "6"
 futures = "0.3"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
 serde = { version = "1", features = ["derive"] }
-tokio = { version = "1", features = ["process", "io-util", "fs", "rt", "macros"] }
+tokio = { version = "1", features = ["process", "io-util", "fs", "rt", "macros", "time"] }
 which = "7"
 zip = { version = "2", default-features = false, features = ["deflate"] }

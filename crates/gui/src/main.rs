@@ -87,6 +87,7 @@ enum Message {
     ClearFinished,
     ToolsChecked(Vec<tools::Status>),
     Install(Tool),
+    Recheck,
     Installed(Result<(), String>),
     DismissUpdates,
 }
@@ -230,6 +231,11 @@ impl App {
                 }
                 return Task::perform(tools::check(), Message::ToolsChecked);
             }
+            Message::Recheck => {
+                self.tools = None;
+                self.tool_error = None;
+                return Task::perform(tools::check(), Message::ToolsChecked);
+            }
             Message::DismissUpdates => self.updates_dismissed = true,
         }
         Task::none()
@@ -357,7 +363,7 @@ impl App {
     fn tools_notice(&self) -> Option<Element<'_, Message>> {
         let Some(statuses) = &self.tools else {
             return Some(
-                text("Checking yt-dlp and ffmpeg…")
+                text("Checking yt-dlp, ffmpeg and Deno…")
                     .size(13)
                     .style(style::muted_text)
                     .into(),
@@ -370,6 +376,13 @@ impl App {
         for status in statuses {
             let name = status.tool.name();
             let line: Option<(String, &str)> = match &status.installed {
+                None if status.problem.is_some() => Some((
+                    format!(
+                        "{} Antivirus may be blocking it.",
+                        status.problem.as_deref().unwrap_or_default()
+                    ),
+                    "Check again",
+                )),
                 None if status.tool == Tool::Deno => Some((
                     "Deno is not installed. YouTube needs it for full support.".to_string(),
                     "Install",
@@ -399,12 +412,16 @@ impl App {
                     .padding([3, 10])
                     .style(style::action);
                 if self.installing.is_none() {
-                    b = b.on_press(Message::Install(status.tool));
+                    b = b.on_press(if status.problem.is_some() {
+                        Message::Recheck
+                    } else {
+                        Message::Install(status.tool)
+                    });
                 }
                 b.into()
             };
             lines = lines.push(
-                row![text(label).size(13), horizontal_space(), control]
+                row![text(label).size(13).width(Length::Fill), control]
                     .spacing(12)
                     .align_y(Alignment::Center),
             );
